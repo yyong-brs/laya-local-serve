@@ -1,0 +1,45 @@
+# Local-weights HTTP serving override for Laya (air-gapped / manually mounted checkpoint).
+#
+# The stock `laya-serve` resolves checkpoints against the Hugging Face hub and never
+# reads a local path, so this override swaps in `docker/serve_local.py`, which builds
+# ONE Agent from the mounted checkpoint and attaches it to every routing alias.
+#
+# Usage (from the repository root):
+#
+#   export LAYA_CHECKPOINT_PATH=/absolute/path/to/laya-multilingual
+#   docker compose -f compose.yaml -f compose.http.yaml -f compose.cuda.yaml -f compose.local-serve.yaml up --build laya-serve
+#
+# This file must come LAST so its environment overrides win over compose.http.yaml /
+# compose.cuda.yaml. The CUDA build args and the NVIDIA device reservation are provided
+# by compose.cuda.yaml; do not drop it.
+#
+# Notes:
+#   * The checkpoint directory must be writable by UID 10001 (the container user) for
+#     tokenizer compatibility rewrites -- see docker.md "Fine-tuned checkpoints". Mount
+#     is read-write; if your host ACLs block that, `chmod -R a+rwX` the directory first.
+#   * LAYA_BIND_ADDRESS defaults to 0.0.0.0 so the service is reachable on the LAN. Put a
+#     TLS reverse proxy + LAYA_API_KEY in front before exposing it beyond a trusted network;
+#     `/health` never requires auth, but `/v1/systemone` will once LAYA_API_KEY is set.
+services:
+  laya-serve:
+    command: ["python", "/opt/laya/serve_local.py"]
+    environment:
+      # `serve_local.py` reads these; the rest (LAYA_PRELOAD, LAYA_MODELS, LAYA_THREADS,
+      # LAYA_MAX_*, OMP_NUM_THREADS, HF_TOKEN[_FILE]) are inherited from compose.http.yaml
+      # and are harmless / useful here.
+      LAYA_DEVICE: "${LAYA_DEVICE:-cuda}"
+      LAYA_LOCAL_MODEL_PATH: /models/laya-multilingual
+      HF_HUB_OFFLINE: "1"
+      LAYA_HOST: "${LAYA_HOST:-0.0.0.0}"
+      LAYA_PORT: "${LAYA_PORT:-8000}"
+      LAYA_BIND_ADDRESS: "${LAYA_BIND_ADDRESS:-0.0.0.0}"
+      # multilingual ships bf16; fp16 is measurably closer to the fp32 forward on every
+      # shipped checkpoint. Clear this to let the checkpoint keep its own amp_dtype.
+      LAYA_CUDA_AMP: "${LAYA_CUDA_AMP:-fp16}"
+      LAYA_GPU_ID: "${LAYA_GPU_ID:-0}"
+      LAYA_API_KEY: "${LAYA_API_KEY:-}"
+      LAYA_API_KEY_FILE: "${LAYA_API_KEY_FILE:-}"
+      LAYA_LOG_LEVEL: "${LAYA_LOG_LEVEL:-info}"
+    volumes:
+      - ${LAYA_CHECKPOINT_PATH:?Set LAYA_CHECKPOINT_PATH to the checkpoint directory}:/models/laya-multilingual:rw
+      - ./docker/serve_local.py:/opt/laya/serve_local.py:ro

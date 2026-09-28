@@ -1,0 +1,96 @@
+# Dockerfile_new — GPU image with the Laya code AND the locally-mounted
+# checkpoint launcher baked in.
+#
+# Difference from the stock Dockerfile:
+#   * `docker/serve_local.py` is COPYed into the image, so at runtime you only
+#     need to mount the model weights directory (no code mount needed).
+#   * Defaults are set for an air-gapped, GPU-only deployment:
+#       LAYA_DEVICE=cuda, HF_HUB_OFFLINE=1, LAYA_CUDA_AMP=fp16, LAYA_HOST=0.0.0.0
+#   * CMD launches the local-weights server, so `docker run` needs no command.
+#
+# Build (default cu128 + torch 2.11.0 for most NVIDIA GPUs):
+#   docker build -f Dockerfile_new -t laya-local-serve:latest .
+# For DGX Spark (GB10 / arm64) use cu130 (torch 2.14.0 exists on the cu130 index):
+#   docker build --build-arg TORCH_INDEX=cu130 -f Dockerfile_new -t laya-local-serve:latest .
+#
+# Run (only the weights are mounted at runtime):
+#   docker run -d --name laya-serve --gpus all -p 8000:8000 \
+#     -v /abs/path/to/laya-multilingual:/models/laya-multilingual:rw \
+#     -e LAYA_LOCAL_MODEL_PATH=/models/laya-multilingual \
+#     -e LAYA_API_KEY='your-strong-key' \
+#     laya-local-serve:latest
+
+ARG PYTHON_IMAGE=python:3.11-slim-bookworm
+
+FROM ${PYTHON_IMAGE} AS build
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# CUDA build args. Default to cu128 + torch 2.11.0 for mainstream NVIDIA GPUs
+# (torch 2.14.0 is NOT published for cu128; cu128 tops out at 2.11.0). Override
+# with cu130 + torch 2.14.0 on DGX Spark (GB10 / arm64), where 2.14.0 exists on
+# the cu130 index. The check below fails the build if the wheel does not match
+# the requested CUDA index.
+ARG TORCH_INDEX=cu128
+ARG TORCH_VERSION=2.11.0
+COPY docker/check_torch.py /opt/check_torch.py
+# Cache mount so an interrupted/re-run build reuses already-downloaded wheels
+# instead of re-pulling the multi-GB torch + CUDA stack from scratch.
+RUN --mount=type=cache,target=/root/.cache/pip PIP_NO_CACHE_DIR=0 \
+    pip install "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/${TORCH_INDEX} \
+    && python /opt/check_torch.py "${TORCH_INDEX}" \
+    && pip check
+
+WORKDIR /src
+COPY pyproject.toml setup.py README.md LICENSE ./
+COPY laya/ ./laya/
+# The `serve` extra puts `laya-serve` (POST /v1/systemone, GET /health) in the image.
+RUN --mount=type=cache,target=/root/.cache/pip PIP_NO_CACHE_DIR=0 \
+    pip install ".[serve]" && pip check
+
+FROM ${PYTHON_IMAGE} AS runtime
+
+LABEL org.opencontainers.image.title="Laya local-weights GPU server" \
+      org.opencontainers.image.source="https://github.com/NandhaKishorM/laya" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+# torch 2.14 swaps some eager CUDA ops for Triton kernels compiled on first
+# inference, which needs a C compiler this image does not carry (#365). The
+# stock kernels give the same answers at the same latency.
+ENV PATH="/opt/venv/bin:$PATH" \
+    TORCH_DISABLE_NATIVE_JIT=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    USE_TF=0 \
+    USE_TORCH=1 \
+    TOKENIZERS_PARALLELISM=false \
+    OMP_NUM_THREADS=4 \
+    LAYA_DEVICE=cuda \
+    HF_HUB_OFFLINE=1 \
+    LAYA_CUDA_AMP=fp16 \
+    LAYA_HOST=0.0.0.0 \
+    HF_HOME=/home/laya/.cache/huggingface
+
+RUN groupadd --gid 10001 laya \
+    && useradd --uid 10001 --gid laya --create-home laya \
+    && mkdir -p /home/laya/.cache/huggingface \
+    && chown -R laya:laya /home/laya/.cache
+
+COPY --from=build /opt/venv /opt/venv
+COPY LICENSE /usr/share/doc/laya/LICENSE
+COPY examples/docker/ /opt/laya/examples/
+COPY docker/entrypoint.py /opt/laya/entrypoint.py
+# Bake the locally-mounted checkpoint launcher into the image so it does not
+# need to be mounted at runtime.
+COPY docker/serve_local.py /opt/laya/serve_local.py
+USER laya
+WORKDIR /home/laya
+
+# entrypoint handles <NAME>_FILE secret loading, then execs the CMD.
+ENTRYPOINT ["python", "/opt/laya/entrypoint.py"]
+# Default command: serve the locally-mounted checkpoint over the Jev-compatible API.
+CMD ["python", "/opt/laya/serve_local.py"]
