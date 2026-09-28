@@ -32,6 +32,11 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/laya-local-serve
+  # Aliyun ACR (optional). Set the three ALIYUN_* secrets below to also mirror
+  # the built image to your Alibaba Cloud registry for fast domestic pulls.
+  # When ALIYUN_USERNAME is empty the Aliyun steps are skipped automatically.
+  ALIYUN_REGISTRY: ${{ secrets.ALIYUN_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
+  ALIYUN_NAMESPACE: ${{ secrets.ALIYUN_NAMESPACE || github.repository_owner }}
 
 jobs:
   build:
@@ -70,6 +75,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Aliyun Container Registry
+        if: ${{ secrets.ALIYUN_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -85,3 +98,13 @@ jobs:
             TORCH_VERSION=${{ github.event.inputs.torch_version || '2.11.0' }}
           cache-from: type=gha
           cache-to: type=gha
+
+      # Mirror the just-built image to Aliyun ACR by copying the manifest+blobs
+      # (no rebuild). Skipped automatically when ALIYUN_USERNAME is unset.
+      - name: Copy image to Aliyun ACR
+        if: ${{ secrets.ALIYUN_USERNAME != '' }}
+        run: |
+          docker buildx imagetools create \
+            --tags ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/laya-local-serve:latest \
+            --tags ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/laya-local-serve:${{ github.sha }} \
+            ${{ env.IMAGE }}:latest
