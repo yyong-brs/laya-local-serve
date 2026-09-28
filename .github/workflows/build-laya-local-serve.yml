@@ -14,6 +14,7 @@ on:
       - 'laya/**'
       - 'pyproject.toml'
       - 'setup.py'
+      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       torch_index:
@@ -39,6 +40,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # GitHub-hosted ubuntu-latest runners only have ~25 GB disk and ship with
+      # large toolchains we never use (Android SDK, dotnet, Haskell, Swift...).
+      # Building the torch cu128 + nvidia-* image fills the disk and the run dies
+      # with "No space left on device" on the runner's own log path. Free it first.
+      - name: Free disk space on runner
+        run: |
+          echo "Disk before:"; df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/hostedtoolcache/*
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/lib/mono*
+          sudo swapoff -a
+          sudo rm -f /swapfile
+          sudo apt-get clean -y 2>/dev/null || true
+          echo "Disk after:"; df -h /
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -63,4 +84,4 @@ jobs:
             TORCH_INDEX=${{ github.event.inputs.torch_index || 'cu128' }}
             TORCH_VERSION=${{ github.event.inputs.torch_version || '2.11.0' }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha
