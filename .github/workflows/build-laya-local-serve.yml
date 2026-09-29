@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # GitHub-hosted ubuntu-latest runners only have ~25 GB disk and ship with
       # large toolchains we never use (Android SDK, dotnet, Haskell, Swift...).
