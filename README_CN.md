@@ -123,31 +123,92 @@ docker load -i laya-local-serve.tar
 
 > 注意：镜像含 torch cu128 + CUDA 运行时，体积约 8 GB+，GHCR 免费额度有限，注意清理旧 tag。
 
+> **GHCR 私有包跨仓库拉取报错 `unauthorized`**：`yyong-brs/laya-local-serve` 是私有仓库，
+> 其 GHCR 包默认也私有。若在**另一个** GitHub 项目的 flow 里用该项目自己的 `GITHUB_TOKEN`
+> 登录 `ghcr.io` 后 `docker pull`，会报 `unauthorized`——因为该 token 只限当前仓库、读不到
+> 另一仓库的私有包（登录能过、拉取被拒）。两种解法：① 把 GHCR 包可见性改为 **Public**
+> （GitHub → Packages → 该包 → Settings），改完免登录直接 `docker pull`；② 保持私有则在另一个
+> 项目 Secrets 中放一个勾了 `read:packages` 的 PAT，用
+> `echo "$PAT" | docker login ghcr.io -u yyong-brs --password-stdin`。
+> 国内直接拉 GHCR 较慢，推荐改用下面的阿里云 ACR。
+
+### 3.5 国内从阿里云 ACR 拉取（推荐）
+
+工作流在推送到 GHCR 之后，会自动把镜像**同构件复制**到阿里云容器镜像服务 ACR
+（`docker buildx imagetools create` 仅复制 manifest+blobs，不二次编译）。该步骤通过 Secrets
+控制，**未设置阿里云密钥时自动跳过**，不影响现有 GHCR 推送。
+
+启用步骤：
+
+1. 在 GitHub 仓库 **Settings → Secrets and variables → Actions → New repository secret**
+   添加以下密钥（仅当 `ALIYUN_USERNAME` 存在时才触发阿里云推送）：
+
+   | Secret 名 | 含义 | 默认值 |
+   |---|---|---|
+   | `ALIYUN_USERNAME` | 阿里云账号名 / RAM 子账号 | （无 → 跳过阿里云步骤） |
+   | `ALIYUN_PASSWORD` | 阿里云密码 / ACR 专用登录密码 | —— |
+   | `ALIYUN_REGISTRY` | ACR 地域域名（可选） | `registry.cn-hangzhou.aliyuncs.com` |
+   | `ALIYUN_NAMESPACE` | ACR 命名空间（可选） | 仓库 owner（`yyong-brs`） |
+
+   > 地域域名默认杭州；若用其他地域请设 `ALIYUN_REGISTRY`，例如上海
+   > `registry.cn-shanghai.aliyuncs.com`、深圳 `registry.cn-shenzhen.aliyuncs.com`。
+
+2. 推送 `main`（或改动 `Dockerfile_new` 等受监控文件）触发构建，Actions 日志出现
+   `Copy image to Aliyun ACR` 即复制成功。
+
+3. 在国内部署机上拉取（需先在阿里云 ACR 把该镜像设为**公开**，或给部署机 RAM 读权限）：
+
+   ```bash
+   docker login <ALIYUN_REGISTRY> -u <ALIYUN_USERNAME> -p <ALIYUN_PASSWORD>
+   docker pull <ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/laya-local-serve:latest
+   docker save <ALIYUN_REGISTRY>/<ALIYUN_NAMESPACE>/laya-local-serve:latest -o laya-local-serve.tar
+   # 拷到内网机后：docker load -i laya-local-serve.tar
+   ```
+
 ---
 
 ## 4. 运行容器
 
-运行时**只需挂载模型权重目录**，并设置两个环境变量（`LAYA_LOCAL_MODEL_PATH` 必填）。
-`LAYA_DEVICE`、`HF_HUB_OFFLINE`、`LAYA_CUDA_AMP`、`LAYA_HOST` 等已在镜像中设为默认值，无需再传。
+镜像已将 Laya 代码与本地权重启动器 `serve_local.py` 烤进内部，并把启动命令
+`python /opt/laya/serve_local.py` 设为容器的默认 `CMD`（由镜像 `ENTRYPOINT` 的
+`entrypoint.py` 负责加载 `_FILE` 形式密钥后转交执行）。因此 **`docker run` 末尾
+不需要再写启动命令**——下面的命令就是完整且自包含的启动方式。
+
+运行时只需做两件事：**挂载权重目录** + **通过 `-e` 直接传入环境变量**。
+
+### 4.1 启动命令（环境变量直接写在命令中）
 
 ```bash
 docker run -d --name laya-serve --gpus all \
   -p 8000:8000 \
   -v /abs/path/to/laya-multilingual:/models/laya-multilingual:rw \
   -e LAYA_LOCAL_MODEL_PATH=/models/laya-multilingual \
+  -e LAYA_DEVICE=cuda \
+  -e HF_HUB_OFFLINE=1 \
+  -e LAYA_CUDA_AMP=fp16 \
+  -e LAYA_HOST=0.0.0.0 \
+  -e LAYA_PORT=8000 \
   -e LAYA_API_KEY='你的强密钥' \
   laya-local-serve:latest
 ```
 
-参数说明：
+> 说明：上面把 `LAYA_DEVICE` / `HF_HUB_OFFLINE` / `LAYA_CUDA_AMP` / `LAYA_HOST` /
+> `LAYA_PORT` 都显式写成 `-e`，是为了**在命令中直接看清并可控**（这些在镜像里已是默认值）。
+> 若接受默认行为，可只保留 `LAYA_LOCAL_MODEL_PATH`（必填）与 `LAYA_API_KEY`（建议设置）。
+> 镜像的容器启动命令 `python /opt/laya/serve_local.py` 已内置，**不要**在命令末尾重复追加它。
+
+### 4.2 参数说明
 
 - `--gpus all`：启用 NVIDIA GPU（需宿主机安装 NVIDIA Container Toolkit）。老版本 Docker 不支持
   `--gpus` 时改用 `--runtime=nvidia`（需 `nvidia-docker2`）。
 - `-v ...:/models/laya-multilingual:rw`：将已下载好的 `laya-multilingual` **完整目录**挂载进容器。
-  目录内需包含 `rl_agent_config.json`、`model.safetensors`、`tokenizer/`、`encoder/` 等权重文件。
-- `-e LAYA_LOCAL_MODEL_PATH`：告知启动器权重目录；**必填**，缺失会直接退出。
+  目录内需包含 `rl_agent_config.json`、`model.safetensors`、`tokenizer/`、`encoder/` 等权重文件；
+  `:rw` 是因为首次加载会重写 `tokenizer_config.json`。
+- `-e LAYA_LOCAL_MODEL_PATH`：**必填**，告知启动器权重目录；缺失会直接退出。
 - `-e LAYA_API_KEY`：设置后 `/v1/systemone` 要求 Bearer 鉴权；不需要鉴权则去掉该行
-  （`/health` 始终免鉴权）。也可用 `LAYA_API_KEY_FILE=/run/secrets/xxx` 挂载密钥文件。
+  （`/health` 始终免鉴权）。也可改用 `LAYA_API_KEY_FILE=/run/secrets/xxx` 挂载密钥文件，
+  由 `entrypoint.py` 自动读取并注入环境变量。
+- `-e LAYA_GPU_ID`：多卡时指定 GPU 编号（默认 `0`）。
 
 ---
 
@@ -193,8 +254,9 @@ curl -s localhost:8000/v1/systemone \
 
 1. **先确认失败发生在哪一步**（用 `--progress=plain` 重跑）：
    - 死在 `Installing collected packages: ... torch` / `COPY --from=build /opt/venv` → 内存不足。
-     → 单 stage 已去掉 `COPY --from=build` 这个最重的拷贝；若仍死在 `pip install torch` 解压，
-       说明 WSL2 内存仍不够，**回到 3.1 把内存提到 8 GB+**。
+     本镜像为官方多 stage 写法，跨 stage 的 `COPY --from=build /opt/venv` 与 `pip install torch`
+     解压都会吃大量内存。若你在**本机 WSL2 直接构建**仍死在这一步，说明 WSL2 内存仍不够，
+     **回到 3.1 把内存提到 8 GB+**；或干脆走 3.4 的 CI 构建（runner 内存充足，可稳定通过）。
    - 死在正在 `Downloading ... .whl` 且速度很慢/中断 → 网络抖动，调完内存后重跑即可
      （成功过的层会 `CACHED`，不会重下）。
 2. **磁盘是否写满**：`df -h` 看 Docker 所在盘；或用 `docker system df` 看 BuildKit 缓存占用。
